@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <title>GPU 校验</title>
+    <style>body{font-family:monospace;padding:16px;background:#0f141b;color:#e6edf3}pre{white-space:pre-wrap}</style>
+  </head>
+  <body>
+    <canvas id="c"></canvas>
+    <pre id="result">running…</pre>
+    <script type="module">
+      import { generateSyntheticDoc, SYNTHETIC_SCENARIOS } from '/src/core/synthetic.ts';
+      import { separateCpu, evaluateSeparation } from '/src/core/metrics.ts';
+      import { nnls2, reflectanceToAbsorbance } from '/src/core/nnls.ts';
+      import { getInk, inkAbsorbance, PAPER_REFLECTANCE } from '/src/core/spectra.ts';
+      import { SeparationEngine } from '/src/webgl/SeparationEngine.ts';
+
+      const out = document.getElementById('result');
+      const report = { steps: [], ok: true };
+      const log = (name, data) => report.steps.push({ name, ...data });
+      const finish = () => {
+        report.ok = report.steps.every((s) => s.pass !== false);
+        out.textContent = JSON.stringify(report, null, 2);
+        window.__GPU_CHECK_DONE__ = true;
+      };
+
+      try {
+        const engine = new SeparationEngine(document.getElementById('c'));
+        log('engine-init', { pass: true });
+
+        for (const scenario of SYNTHETIC_SCENARIOS) {
+          const doc = generateSyntheticDoc(scenario, { width: 400, height: 566, seed: 42 });
+          const a1 = inkAbsorbance(getInk(scenario.ink1Id));
+          const a2 = inkAbsorbance(getInk(scenario.ink2Id));
+          engine.uploadBands(doc.bands);
+          engine.separate({ a1, a2, paper: PAPER_REFLECTANCE, globalWeights: [1,1,1,1,1,1], rois: [] });
+          const gpu = engine.readMaps();
+          const cpu = separateCpu(doc.bands, a1, a2);
+
+          let d1sum = 0, d2sum = 0, d1max = 0, d2max = 0;
+          const n = gpu.width * gpu.height;
+          for (let i = 0; i < n; i++) {
+            const d1 = Math.abs(gpu.c1[i] - cpu.c1[i]);
+            const d2 = Math.abs(gpu.c2[i] - cpu.c2[i]);
+            d1sum += d1; d2sum += d2; d1max = Math.max(d1max, d1); d2max = Math.max(d2max, d2);
+          }
+          const mGpu = evaluateSeparation({ c1: gpu.c1, c2: gpu.c2, residual: gpu.residual, width: gpu.width, height: gpu.height }, doc.groundTruth);
+          const mCpu = evaluateSeparation(cpu, doc.groundTruth);
+          const pass = d1sum / n < 0.02 && d2sum / n < 0.02 && mGpu.crossColor < 0.05;
+          log(`scenario:${scenario.id}`, {
+            pass,
+            cpuGpuMeanAbs: { c1: +(d1sum / n).toFixed(5), c2: +(d2sum / n).toFixed(5) },
+            cpuGpuMaxAbs: { c1: +d1max.toFixed(4), c2: +d2max.toFixed(4) },
+            gpuCrossColor: +(mGpu.crossColor * 100).toFixed(2) + '%',
+            cpuCrossColor: +(mCpu.crossColor * 100).toFixed(2) + '%',
+            gpuPaperFP: +(mGpu.paperFalsePositive * 100).toFixed(2) + '%',
+          });
+        }
+
+        // ROI 局部权重一致性：中央区域抬高 NIR 权重
+        {
+          const scenario = SYNTHETIC_SCENARIOS[0];
+          const doc = generateSyntheticDoc(scenario, { width: 300, height: 424, seed: 7 });
+          const a1 = inkAbsorbance(getInk(scenario.ink1Id));
+          const a2 = inkAbsorbance(getInk(scenario.ink2Id));
+          const roi = {
+            id: 'roi_t', name: 'T', x0: 0.25, y0: 0.25, x1: 0.75, y1: 0.75,
+            weights: [1, 1, 1, 1, 1, 3], visible: true, color: '#fff',
+          };
+          engine.uploadBands(doc.bands);
+          engine.separate({ a1, a2, paper: PAPER_REFLECTANCE, globalWeights: [1,1,1,1,1,1], rois: [roi] });
+          const gpu = engine.readMaps();
+
+          // CPU 逐像素复现同样的权重选择
+          const c1 = new Float32Array(gpu.width * gpu.height);
+          const c2 = new Float32Array(gpu.width * gpu.height);
+          const refl = [0,0,0,0,0,0];
+          for (let y = 0; y < gpu.height; y++) {
+            for (let x = 0; x < gpu.width; x++) {
+              const ux = x / (gpu.width - 1), uy = y / (gpu.height - 1);
+              const inside = ux >= 0.25 && ux <= 0.75 && uy >= 0.25 && uy <= 0.75;
+              const w = inside ? roi.weights : [1,1,1,1,1,1];
+              const i = y * gpu.width + x;
+              for (let b = 0; b < 6; b++) refl[b] = doc.bands[b].data[i];
+              const yy = reflectanceToAbsorbance(refl, PAPER_REFLECTANCE);
+              const r = nnls2(yy, a1, a2, w);
+              c1[i] = r.c1; c2[i] = r.c2;
+            }
+          }
+          let diffSum = 0, max = 0;
+          for (let i = 0; i < c1.length; i++) {
+            const d = Math.max(Math.abs(gpu.c1[i] - c1[i]), Math.abs(gpu.c2[i] - c2[i]));
+            diffSum += d; max = Math.max(max, d);
+          }
+          // 对照：不带 ROI 权重的分离，ROI 内结果必须发生可观测变化（证明权重真正生效）
+          engine.separate({ a1, a2, paper: PAPER_REFLECTANCE, globalWeights: [1,1,1,1,1,1], rois: [] });
+          const base = engine.readMaps();
+          let changed = 0, insideN = 0;
+          for (let y = 0; y < gpu.height; y++) {
+            for (let x = 0; x < gpu.width; x++) {
+              const ux = x / (gpu.width - 1), uy = y / (gpu.height - 1);
+              if (ux >= 0.25 && ux <= 0.75 && uy >= 0.25 && uy <= 0.75) {
+                insideN++;
+                const i = y * gpu.width + x;
+                if (Math.abs(gpu.c1[i] - base.c1[i]) + Math.abs(gpu.c2[i] - base.c2[i]) > 1e-4) changed++;
+              }
+            }
+          }
+          const effectRatio = changed / insideN;
+          log('roi-weight-cpu-gpu', {
+            pass: diffSum / c1.length < 0.025 && effectRatio > 0.5,
+            meanAbs: +(diffSum / c1.length).toFixed(5),
+            maxAbs: +max.toFixed(4),
+            roiPixelsChanged: +(effectRatio * 100).toFixed(1) + '%',
+          });
+        }
+
+        // A4@200DPI 性能计时（3 次取中位数）
+        {
+          const scenario = SYNTHETIC_SCENARIOS[0];
+          const doc = generateSyntheticDoc(scenario, { width: 1654, height: 2339, seed: 11 });
+          const a1 = inkAbsorbance(getInk(scenario.ink1Id));
+          const a2 = inkAbsorbance(getInk(scenario.ink2Id));
+          engine.uploadBands(doc.bands);
+          const times = [];
+          for (let k = 0; k < 3; k++) {
+            times.push(engine.separate({ a1, a2, paper: PAPER_REFLECTANCE, globalWeights: [1,1,1,1,1,1], rois: [] }));
+          }
+          times.sort((a, b) => a - b);
+          const m = evaluateSeparation(
+            (() => { const mm = engine.readMaps(); return { c1: mm.c1, c2: mm.c2, residual: mm.residual, width: mm.width, height: mm.height }; })(),
+            doc.groundTruth,
+          );
+          log('a4-200dpi-perf', { pass: times[1] < 3000, medianMs: +times[1].toFixed(1), allMs: times.map((t) => +t.toFixed(1)), crossColor: +(m.crossColor * 100).toFixed(2) + '%', pixels: 1654 * 2339 });
+        }
+
+        engine.dispose();
+      } catch (e) {
+        log('fatal', { pass: false, error: String(e && e.stack || e) });
+      }
+      finish();
+    </script>
+  </body>
+</html>

@@ -1,0 +1,31 @@
+{
+  "name": "mojian",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "墨鉴 - 多波段可疑文书墨水分层检验工具 (WebGL2)",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit",
+    "gpu:check": "node gpu-check/run.mjs",
+    "e2e": "node e2e/smoke.mjs",
+    "verify": "tsc --noEmit && vitest run && node gpu-check/run.mjs"
+  },
+  "dependencies": {
+    "react": "18.3.1",
+    "react-dom": "18.3.1"
+  },
+  "devDependencies": {
+    "@types/react": "18.3.12",
+    "@types/react-dom": "18.3.1",
+    "@vitejs/plugin-react": "4.3.4",
+    "playwright": "^1.48.2",
+    "typescript": "5.6.3",
+    "vite": "5.4.11",
+    "vitest": "2.1.5"
+  }
+}
